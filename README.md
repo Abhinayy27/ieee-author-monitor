@@ -6,9 +6,9 @@ An automated monitoring agent that tracks an IEEE Xplore author profile for new 
 
 This project uses GitHub Actions to automatically check the IEEE Xplore author profile twice daily (00:00 and 12:00 UTC). When a new publication is detected, it sends an email notification and updates its state to track the new count.
 
-**Target Page:** https://ieeexplore.ieee.org/author/113479857928040
+**Target Page:** *IEEE Author Page*
 
-**Email Recipient:** babhinay27@gmail.com
+**Email Recipient:** *Your Email*
 
 ## How It Works
 
