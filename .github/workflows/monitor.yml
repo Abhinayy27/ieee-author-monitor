@@ -1,4 +1,4 @@
-name: IEEE ICONAT 2025 Monitor
+name: IEEE Author Profile Monitor
 
 on:
   schedule:
@@ -53,6 +53,6 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add state.json
-          git commit -m "Update state: ICONAT 2025 notification sent"
+          git commit -m "Update state: author publication count changed"
           git push
 

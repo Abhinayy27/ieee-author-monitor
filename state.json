@@ -1,4 +1,6 @@
 {
-  "notified": false
+  "publication_count": 1,
+  "publication_titles": [
+    "Stacked Ensemble-Based Classification Model for Breast Cancer Diagnosis with Boruta Feature Selection and MLP Optimization"
+  ]
 }
-
