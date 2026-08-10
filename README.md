@@ -76,7 +76,7 @@ Edit `checker.py`:
 
 ```python
 TARGET_URL = "https://ieeexplore.ieee.org/author/113479857928040"
-RECIPIENT_EMAIL = "babhinay27@gmail.com"
+RECIPIENT_EMAIL = "youremail.com"
 ```
 
 ## File Structure
