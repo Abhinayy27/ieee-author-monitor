@@ -9,20 +9,30 @@ and sends an email notification when the publication count increases.
 import json
 import logging
 import os
+import re
 import smtplib
 import sys
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import requests
 from bs4 import BeautifulSoup
 
 # Configuration
 TARGET_URL = "https://ieeexplore.ieee.org/author/113479857928040"
 STATE_FILE = "state.json"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+MIN_RENDERED_PAGE_BYTES = 50000
+FETCH_MAX_ATTEMPTS = 3
+SELECTOR_WAIT_MS = 30000
+
+PUBLICATION_COUNT_SELECTORS = [
+    "div.publications.col-12 div.pub-citation-count",
+    "div.publications div.pub-citation-count",
+    "div.publication-box div.publications div.pub-citation-count",
+]
 
 # Email configuration
 SMTP_SERVER = "smtp.gmail.com"
@@ -75,68 +85,126 @@ def save_state(state: Dict) -> None:
         raise
 
 
-def fetch_page(url: str) -> Optional[str]:
-    """Fetch the target page, using Playwright if available for JS-rendered content."""
-    if PLAYWRIGHT_AVAILABLE:
-        try:
-            logger.info(f"Fetching page with Playwright: {url}")
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    locale="en-US",
-                )
-                page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    page.wait_for_selector(
-                        "div.publications.col-12 div.pub-citation-count",
-                        timeout=15000,
-                    )
-                except Exception:
-                    logger.warning("Timeout waiting for publication count, continuing")
-                page.wait_for_timeout(3000)
-                html_content = page.content()
-                browser.close()
-            logger.info(f"Fetched page with Playwright ({len(html_content)} bytes)")
-            return html_content
-        except Exception as e:
-            logger.warning(f"Playwright fetch failed: {e}. Falling back to requests.")
+def _parse_count_text(text: str) -> Optional[int]:
+    """Parse a numeric publication count from element text."""
+    cleaned = text.strip()
+    if cleaned.isdigit():
+        return int(cleaned)
+    match = re.search(r"\d+", cleaned)
+    if match:
+        return int(match.group())
+    return None
 
-    try:
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Referer": "https://ieeexplore.ieee.org/",
-        }
-        logger.info(f"Fetching page with requests: {url}")
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        logger.error(f"Error fetching page: {e}")
-        return None
+
+def _log_parse_failure(html_content: str) -> None:
+    """Log diagnostic info when publication count parsing fails."""
+    logger.warning(f"Page size: {len(html_content)} bytes")
+    if "pub-citation-count" in html_content:
+        logger.info("HTML contains 'pub-citation-count' but parser could not extract value")
+    else:
+        logger.info("HTML does not contain 'pub-citation-count' (page likely not fully rendered)")
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    page_text = soup.get_text(separator="\n", strip=True)
+    sample_lines = [line for line in page_text.split("\n") if line.strip()][:20]
+    if sample_lines:
+        logger.info("First visible lines on page:")
+        for i, line in enumerate(sample_lines):
+            logger.info(f"  {i + 1}: {line[:120]}")
 
 
 def parse_publication_count(html_content: str) -> Optional[int]:
     """Extract the publication count from the author profile page."""
     soup = BeautifulSoup(html_content, "html.parser")
-    pub_div = soup.select_one("div.publications.col-12")
-    if not pub_div:
-        logger.warning("Could not find publications section on page")
-        return None
 
-    count_el = pub_div.select_one("div.pub-citation-count")
-    if not count_el:
-        logger.warning("Could not find publication count element")
-        return None
+    for selector in PUBLICATION_COUNT_SELECTORS:
+        count_el = soup.select_one(selector)
+        if count_el:
+            count = _parse_count_text(count_el.get_text(strip=True))
+            if count is not None:
+                logger.info(f"Found publication count via selector: {selector}")
+                return count
 
-    try:
-        return int(count_el.get_text(strip=True))
-    except ValueError:
-        logger.warning(f"Invalid publication count: {count_el.get_text(strip=True)!r}")
-        return None
+    for title_el in soup.select("div.publications-title"):
+        if title_el.get_text(strip=True).lower() != "publications":
+            continue
+        parent = title_el.find_parent("div", class_=lambda c: c and "publications" in c)
+        if not parent:
+            continue
+        count_el = parent.select_one("div.pub-citation-count")
+        if count_el:
+            count = _parse_count_text(count_el.get_text(strip=True))
+            if count is not None:
+                logger.info("Found publication count via publications-title parent")
+                return count
+
+    _log_parse_failure(html_content)
+    return None
+
+
+def _fetch_with_playwright(url: str) -> Optional[str]:
+    """Fetch page HTML after waiting for the Angular-rendered publication count."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=USER_AGENT, locale="en-US")
+        page = context.new_page()
+
+        try:
+            for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+                logger.info(f"Playwright fetch attempt {attempt}/{FETCH_MAX_ATTEMPTS}")
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const el = document.querySelector('div.publications div.pub-citation-count');
+                            return el && /^\\d+$/.test(el.textContent.trim());
+                        }""",
+                        timeout=SELECTOR_WAIT_MS,
+                    )
+                    logger.info("Publication count element rendered")
+                except Exception:
+                    logger.warning(
+                        f"Timed out waiting for publication count (attempt {attempt})"
+                    )
+
+                page.wait_for_timeout(2000)
+                html_content = page.content()
+                logger.info(f"Fetched page ({len(html_content)} bytes)")
+
+                if parse_publication_count(html_content) is not None:
+                    return html_content
+
+                if len(html_content) < MIN_RENDERED_PAGE_BYTES:
+                    logger.warning(
+                        f"Page looks under-rendered ({len(html_content)} bytes); retrying"
+                    )
+
+                if attempt < FETCH_MAX_ATTEMPTS:
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(2)
+
+            final_html = page.content()
+            _log_parse_failure(final_html)
+            return final_html
+        finally:
+            browser.close()
+
+
+def fetch_page(url: str) -> Optional[str]:
+    """Fetch the target page, using Playwright with retries for JS-rendered content."""
+    if PLAYWRIGHT_AVAILABLE:
+        try:
+            logger.info(f"Fetching page with Playwright: {url}")
+            return _fetch_with_playwright(url)
+        except Exception as e:
+            logger.error(f"Playwright fetch failed: {e}")
+
+    logger.error(
+        "Playwright is required for IEEE author pages. "
+        "Plain HTTP requests cannot render JavaScript content."
+    )
+    return None
 
 
 def parse_publication_titles(html_content: str) -> List[str]:
